@@ -1,0 +1,30 @@
+{
+    "audio": {
+        "sample_rate": 16000,
+        "channels": 1,
+        "chunk_size": 512,
+        "processing_interval": 0.06,
+        "sleep_time": 0.01
+    },
+    "tracking": {
+        "change_threshold": 1,
+        "confidence_threshold": 0.5,
+        "look_ahead_distance": 10,
+        "min_word_length": 2,
+        "force_change_threshold": 3,
+        "early_change_ratio": 0.70,
+        "duplicated_first_half_threshold": 0.90,
+        "duplicated_second_half_threshold": 0.80
+    },
+    "powerpoint": {
+        "advance_key": "pagedown",
+        "back_key": "pageup"
+    },
+    "slide_change": {
+        "long_slide_threshold": 12,
+        "progress_threshold_short": 0.70,
+        "progress_threshold_long": 0.65,
+        "remaining_words_short": 1,
+        "remaining_words_long": 2
+    }
+}
