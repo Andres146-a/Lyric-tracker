@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+.hypothesis/
+
+# Entornos virtuales
+venv/
+env/
+ENV/
+.env/
+.venv/
+
+# Modelos de ML/IA
+models/
+*.pth
+*.pt
+*.h5
+*.keras
+*.joblib
+*.pkl
+*.model
+
+# Archivos de audio/video grandes
+test_files/
+*.mp3
+*.wav
+*.mp4
+*.avi
+*.mov
+*.flac
+*.aac
+
+# Datos y logs
+*.log
+logs/
+data/
+*.csv
+*.jsonl
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Configuración local
+config.local.json
+.env.local
