@@ -1,14 +1,13 @@
 import json
 import time
 import re
-
 import jellyfish 
 class LyricTracker:
     def __init__(self, lyrics_data, start_slide=None):
         self.stuck_position = 0
         self.coro_fase = 0          # 0=normal | 1=primera rep | 2=segunda rep
         self.coro_crossed = False  # evita repetir el cruce del //
-        self._just_reloaded = False  # Flag para ignorar sincronización inmediata
+
         self.last_strong_word_time = time.time()
         self.start_time = time.time()
         
@@ -120,9 +119,10 @@ class LyricTracker:
     def previous_slide(self):
         """Para cuando presiones tecla de retroceder"""
         if self.current_slide > 1:
+            self.force_reload_current_slide(reset_progress=True)
             self.current_slide -= 1
             self.current_word_index = 0
-            self.force_reload_current_slide(reset_progress=True)  # ← QUITA self.tracker. y pon reset_progress=True
+            self.force_reload_current_slide()
             print(f"← RETROCESO MANUAL → Slide {self.current_slide} recargado 100% limpio")
             self._preload_slides_ahead(3)
             return True
@@ -131,25 +131,21 @@ class LyricTracker:
             return False
 
     def next_slide(self):
-        next_slide_num = self.current_slide + 1
-        next_key = f"slide_{next_slide_num}"
-        
-        if next_key not in self.lyrics_data:
-            # No hay más slides → NO aumentamos current_slide
-            print("🎉 FIN DE CANCIÓN DETECTADO - Manteniendo slide actual (no hay slide siguiente)")
-            # Opcional: marcar canción terminada aquí si quieres
-            return False  # Indica que no hay siguiente
-        
-        # Si hay slide siguiente, procedemos normal
-        self.current_slide = next_slide_num
+        """Cambio de slide (automático o manual)"""
+        self.current_slide += 1
         self.current_word_index = 0
         self.last_slide_change_time = time.time()
+
+        # ← CLAVE: reset_progress=True para inicializar correctamente el estado del coro
         self.force_reload_current_slide(reset_progress=True)
+
         slide_key = f"slide_{self.current_slide}"
         self.current_slide_metadata = self.slide_metadata.get(slide_key, [])
         print(f"→ Slide {self.current_slide} cargado LIMPIO y listo para cantar desde aquí")
+
         self._preload_slides_ahead(3)
         return True
+
 
     def force_reload_current_slide(self, reset_progress=False):
         """
@@ -157,15 +153,17 @@ class LyricTracker:
         reset_progress = True SOLO cuando hay cambio real de slide.
         """
         slide_key = f"slide_{self.current_slide}"
+
         # Limpiar caché viejo
         self.slide_words_cache.pop(slide_key, None)
         self.slide_metadata.pop(slide_key, None)
         self.preloaded_slides.pop(self.current_slide, None)
-        
+
         # Reconstruir desde cero con normalización completa
         words = self.lyrics_data.get(slide_key, [])
         metadata_words = []
         content_words = []
+
         for word in words:
             if isinstance(word, str) and (
                 word.startswith("DUPLICADO") or
@@ -179,42 +177,29 @@ class LyricTracker:
                 cleaned = re.sub(r'[^a-z]', '', cleaned)
                 if cleaned:
                     content_words.append(cleaned)
+
         self.slide_words_cache[slide_key] = content_words
         self.slide_metadata[slide_key] = metadata_words
         self.current_slide_metadata = metadata_words
+
         print(
             f"RECARGA FORZADA slide {self.current_slide} → "
             f"{len(content_words)} palabras listas (normalizadas)"
         )
-        
-        # Gestión del estado del coro
-                # Gestión del estado del coro
+
+        # 🔑 GESTIÓN CORRECTA DEL ESTADO
         if reset_progress:
             self.current_word_index = 0
             self.last_progress_time = time.time()
-            self.coro_crossed = False  # Limpieza importante
+
             if self.is_current_slide_duplicated():
                 self.coro_fase = 1
+                self.coro_crossed = False
                 print("🎵 CORO DETECTADO → Fase 1 iniciada")
             else:
                 self.coro_fase = 0
-        else:
-            if self.is_current_slide_duplicated():
-                half_point = self.get_duplication_split_point()
-                
-                if self.coro_fase == 0:
-                    self.coro_fase = 1
-                    self.coro_crossed = False
-                    print("🎵 CORO RECARGADO → Restaurando Fase 1")
-                
-                # Impulso suave si ya estábamos avanzados
-                if self.current_word_index >= int(half_point * 0.5):
-                    print("🎵 CORO RECARGADO → Impulso suave a Fase 2")
-                    self.coro_fase = 2
-                    self.coro_crossed = True
-                    self.current_word_index = max(self.current_word_index, half_point)
-                
-                print("🎵 CORO RECARGADO → Manteniendo progreso actual")
+                self.coro_crossed = False
+
 
 
 
@@ -345,31 +330,7 @@ class LyricTracker:
                     "duplicated_second_half_threshold": 0.70
                 }
             }
-# Pseudo-código para tu BalancedAudioProcessor
-    def preprocess_audio(chunk):
-        # 1. Normalizar volumen (evita clipping en voces fuertes masculinas)
-        chunk = normalize_rms(chunk, target_rms=-18)
-        
-        # 2. EQ paramétrico balanceado
-        # Boost suave en medios-altos para mujeres + preservación graves
-        eq = parametric_eq(chunk,
-                        bands=[
-                            {'freq': 120,  'gain': +2,   'q': 1.0},   # graves cálidos (hombres)
-                            {'freq': 3500, 'gain': +5,   'q': 1.4},   # presencia/claridad
-                            {'freq': 8000, 'gain': +4,   'q': 2.0}    # aire para voces agudas
-                        ])
-        
-        # 3. Compresión multibanda (más suave en graves)
-        comp = multiband_compressor(eq,
-                                    low_threshold=-25, low_ratio=3,
-                                    mid_threshold=-22, mid_ratio=4,
-                                    high_threshold=-20, high_ratio=5)
-        
-        # 4. Noise gate + reducción de ruido ligera
-        gated = noise_gate(comp, threshold=-42, ratio=10)
-        denoised = webrtc_ns(gated)  # o rnnoise si tienes mejor integración
-        
-        return denoised
+
     def _preprocess_recognized_text(self, text):
         """Preprocesamiento mínimo y escalable"""
         if isinstance(text, list):
@@ -503,16 +464,18 @@ class LyricTracker:
         text = re.sub(r'[^a-z\s]', ' ', text)
         if len(text) < 3:
             return "CONTINUE"
+
         words = [w for w in text.split() if len(w) > 1]
         if not words:
             return "CONTINUE"
-        
+
         current_slide_words = [
             w.lower().replace('á','a').replace('é','e').replace('í','i').replace('ó','o').replace('ú','u')
             for w in self.get_current_slide_text()
         ]
+
         old_index = self.current_word_index
-        
+
         # Matching normal
         for word in words:
             if self.current_word_index >= len(current_slide_words):
@@ -526,17 +489,15 @@ class LyricTracker:
                 word[:3] == expected[:3]
             ):
                 self.current_word_index += 1
-        
+
         # Sincronización segura
         if (
             not self.is_current_slide_duplicated() and
             self.current_word_index < len(current_slide_words) * 0.4
         ):
             self._sync_from_anywhere(words, current_slide_words)
-        
-        if getattr(getattr(self, 'processor', None), 'is_paused', False):
-            return "CONTINUE"
-        
+
+
         # === Anti-stuck por tiempo (DESACTIVADO EN COROS) ===
         tiempo_sin_avance = time.time() - self.last_progress_time
         if (
@@ -548,42 +509,46 @@ class LyricTracker:
         ):
             print(f"ANTI-STUCK GLOBAL: {tiempo_sin_avance:.1f}s sin avance → Forzando cambio")
             return "CHANGE_SLIDE"
-        
+
         # Actualiza tiempo si hubo progreso
         if self.current_word_index > old_index:
             self.last_progress_time = time.time()
             if self.is_current_slide_duplicated():
                 progreso_coro = self.current_word_index / len(current_slide_words)
                 print(f"PROGRESO CORO: {self.current_word_index}/{len(current_slide_words)} ({progreso_coro:.0%}) - Fase {self.coro_fase}")
-        
-        # === Gestión de coros duplicados (FUERA del if progreso) ===
+
+                # === Gestión de coros duplicados (UNIVERSAL + ANTICIPACIÓN INTELIGENTE) ===
         if self.is_current_slide_duplicated():
-            half_point = self.get_duplication_split_point()
+            half_point = self.get_duplication_split_point()  # ya lo tienes como get_duplication_split_point
             total_words = len(current_slide_words)
-            
-            # Cruce al 70% de la primera mitad
-            cross_threshold = int(half_point * 0.70)
+
+            # Cruce tolerante (65% primera mitad)
+            cross_threshold = int(half_point * 0.65)
+
             if self.coro_fase == 1 and not self.coro_crossed and self.current_word_index >= cross_threshold:
                 print(f"CRUCE DE CORO → Segunda repetición iniciada (índice {self.current_word_index}/{half_point})")
                 self.coro_fase = 2
                 self.coro_crossed = True
+                self.current_word_index = half_point
                 self.last_progress_time = time.time()
-            
+
+                        # === ANTICIPACIÓN EN FASE 2 (AJUSTADO PARA DEMORARSE UN POQUITO MÁS) ===
             if self.coro_fase == 2:
-                # Avance al 80% del slide total (alcanzable después de recarga)
-                if self.current_word_index >= int(total_words * 0.80):  # ~17/22
-                    print("CORO COMPLETADO → Cambiando al siguiente slide")
+                # Avance principal: ahora con 70% del slide total (más conservador que 60%)
+                if self.current_word_index >= int(total_words * 0.70):  # ~15-16 palabras en 22
+                    print("CORO CASI COMPLETO (70% segunda vuelta) → Cambiando con fluidez")
                     self.coro_fase = 0
                     self.coro_crossed = False
                     return "CHANGE_SLIDE"
-                
-                # Anti-stuck sensible (12s)
-                if tiempo_sin_avance > 12.0 and self.current_word_index > half_point:
-                    print("ANTI-STUCK EN CORO → Avanzando tras pausa en segunda repetición")
+
+                # Anti-stuck rápido: 8 segundos (en vez de 6) para dar más margen
+                if tiempo_sin_avance > 8.0 and self.current_word_index > half_point:
+                    print("ANTI-STUCK EN CORO → Avanzando tras pausa moderada")
                     self.coro_fase = 0
                     self.coro_crossed = False
                     return "CHANGE_SLIDE"
-        
+        # =====================================================================
+
         # === AVANCE NATURAL POR PROGRESO DE LETRA (fuera de coros) ===
         if not self.is_current_slide_duplicated():
             total = len(current_slide_words)
@@ -591,9 +556,12 @@ class LyricTracker:
                 progreso = self.current_word_index / total
                 umbral = 0.75 if total <= 10 else 0.85
                 if progreso >= umbral:
-                    print(f"🎶 Fin de slide detect. por progreso ({progreso:.0%}, umbral {umbral:.0%}) → Avanzando")
+                    print(
+                        f"🎶 Fin de slide detectado por progreso "
+                        f"({progreso:.0%}, umbral {umbral:.0%}) → Avanzando"
+                    )
                     return "CHANGE_SLIDE"
-        
+
         return "PROGRESS" if self.current_word_index > old_index else "CONTINUE"
 
     def _calculate_optimal_lookahead(self, is_duplicated, half_point):

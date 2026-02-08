@@ -15,8 +15,6 @@ import tkinter as tk
 from threading import Thread
 import keyboard 
 from scipy.signal import resample_poly
-from pedalboard import Pedalboard, Compressor, NoiseGate, Gain, PeakFilter, LowShelfFilter
-from pedalboard.io import AudioStream
 import numpy as np
 _system_running = True
 
@@ -66,47 +64,40 @@ class PowerPointSync:
                 self.last_known_slide = current
                 return
 
-            # NUEVO FIX PRINCIPAL: Si PowerPoint está en el mismo slide que el tracker, ignorar
-            if current == self.tracker.current_slide:
-                # Mismo slide → no hacemos nada, evitamos recargas infinitas
-                self.last_known_slide = current  # Actualizamos para estar seguros
-                return
+            if current != self.last_known_slide:
+                if time.time() - getattr(self, '_last_change_time', 0) < 0.6:
+                    return
 
-            # Solo si es un slide diferente al del tracker, sincronizamos
-            if time.time() - getattr(self, '_last_change_time', 0) < 0.6:
-                return
+                print(f"PowerPoint cambió → Slide {current}")
 
-            print(f"PowerPoint cambió → Slide {current}")
+                slide_key = f"slide_{current}"
+                if slide_key not in self.tracker.lyrics_data:
+                    print(f"⚠️ Slide {current} no existe en la canción → Manteniendo tracker en último slide válido")
+                    # NO actualizamos el tracker → se queda en el último slide válido
+                    self.last_known_slide = current
+                    return  # El tracker NO se mueve, PowerPoint puede estar donde quiera
 
-            slide_text = self.presentation.Slides(current).Shapes[0].TextFrame.TextRange.Text.strip()
-            if not slide_text:
-                print(f"⚠️ Slide {current} está vacío → Manteniendo tracker en último slide válido")
+                # ORDEN CRÍTICO: recargar → limpiar preloaded → volver a precargar
+                self.tracker.current_slide = current
+                self.tracker.current_word_index = 0
+                self.tracker.last_progress_time = time.time()
+                self.tracker.last_strong_word_time = time.time()
+                self.tracker.preloaded_slides.pop(current, None)
 
-            slide_key = f"slide_{current}"
-            if slide_key not in self.tracker.lyrics_data:
-                print(f"⚠️ Slide {current} no existe en la canción → Manteniendo tracker en último slide válido")
+
+                
+                self.tracker.force_reload_current_slide()           # ← 1. recarga limpia
+                self.tracker.preloaded_slides.pop(current, None)   # ← 2. elimina versión vieja
+                self.tracker._preload_slides_ahead(3)                # ← 3. precarga nuevos
+                
+                self.tracker.current_slide_metadata = self.tracker.get_current_slide_metadata()
+                
+                direccion = "Retroceso" if current < self.last_known_slide else "Avance"
+                print(f"{direccion} detectado → Slide {current} recargado 100% limpio")
+                
                 self.last_known_slide = current
-                return
-
-            # Sincronización real
-            self.tracker.current_slide = current
-            self.tracker.current_word_index = 0
-            self.tracker.last_progress_time = time.time()
-            self.tracker.last_strong_word_time = time.time()
-            self.tracker.preloaded_slides.pop(current, None)
-
-            self.tracker.force_reload_current_slide()  # recarga limpia
-            self.tracker.preloaded_slides.pop(current, None)
-            self.tracker._preload_slides_ahead(3)
-
-            self.tracker.current_slide_metadata = self.tracker.get_current_slide_metadata()
-
-            direccion = "Retroceso" if current < self.last_known_slide else "Avance"
-            print(f"{direccion} detectado → Slide {current} recargado 100% limpio")
-
-            self.last_known_slide = current
-            self._last_change_time = time.time()
-            print(f"Sincronizado → Slide {current}")
+                self._last_change_time = time.time()
+                print(f"Sincronizado → Slide {current}")
 
         except Exception as e:
             pass
@@ -146,12 +137,6 @@ class BalancedAudioProcessor:
         
         signal.signal(signal.SIGINT, signal_handler)
         self.overlay = None
-        self.is_paused = False          # ← Inicializamos pausa
-        self.pause_start_time = None
-        
-        keyboard.add_hotkey('f10', lambda: self.toggle_pause())
-        print("🔘 Tecla F10 para PAUSAR/RESUMIR el seguimiento")
-        
         self.overlay_thread = None
         self.model = vosk.Model(model_path)
         self.recognizer = vosk.KaldiRecognizer(self.model, 16000)
@@ -173,13 +158,11 @@ class BalancedAudioProcessor:
             first_available_slide = min(available_slides)
             print(f"📊 Slides disponibles en JSON: {sorted(available_slides)}")
             print(f"🎯 Configurando slide inicial del tracker: {first_available_slide}")
+            
             self.tracker = LyricTracker(lyrics_data, start_slide=first_available_slide)
         else:
             print("⚠️ No se encontraron slides, usando slide 1 por defecto")
             self.tracker = LyricTracker(lyrics_data, start_slide=1)
-        
-        # ← AQUÍ SÍ: después de crear el tracker
-        self.tracker.processor = self   # ← Ahora sí existe self.tracker
         
         print("🔄 Inicializando PowerPointSync...")
         self.ppt_sync = PowerPointSync(self.tracker)
@@ -189,13 +172,12 @@ class BalancedAudioProcessor:
         self.is_listening = True
         self.manual_control_active = False
         self.song_finished = False
-        
         self.config = self._load_config()
         
         self.chunk_size = self.config["audio"]["chunk_size"]
         self.processing_interval = self.config["audio"]["processing_interval"]
         self.sleep_time = self.config["audio"]["sleep_time"]
-        
+
         self.performance_metrics = {
             'total_processing_time': 0,
             'audio_captures': 0,
@@ -204,7 +186,7 @@ class BalancedAudioProcessor:
             'slide_times': [],
             'processing_times': []
         }
-        
+
         print("⚡ Procesador de Audio OPTIMIZADO con controles manuales")
         print(f"🎯 Configuración: chunk_size={self.chunk_size}, interval={self.processing_interval}")
         
@@ -237,60 +219,13 @@ class BalancedAudioProcessor:
                 }
             }
     
-    #Funcioón para pausar el tracker:    
-    def toggle_pause(self):
-        # Toggleamos el estado PRIMERO
-        self.is_paused = not self.is_paused
-        
-        print(f"⏸️ {'PAUSADO' if self.is_paused else 'REANUDADO'}")
-        
-        if self.is_paused:
-            print("⏸️ PAUSA ACTIVADA - El seguimiento se detendrá hasta que se reanude")
-            try:
-                self.stream.stop()  # sounddevice usa .stop()
-            except:
-                pass
-            self.pause_start_time = time.time()
-            self.recognizer.Reset()  # Limpia contexto de Vosk
-        else:
-            print("▶️ REANUDANDO - El seguimiento continuará ahora")
-            try:
-                self.stream.start()  # sounddevice usa .start()
-            except:
-                pass
-            
-            # Ajustamos timers para que la pausa no cuente como "stuck"
-            if self.pause_start_time is not None:
-                pause_duration = time.time() - self.pause_start_time
-                self.tracker.last_progress_time += pause_duration
-                self.tracker.last_slide_change_time += pause_duration
-                # Reseteamos stuck para evitar saltos inmediatos
-                if hasattr(self.tracker, 'stuck_start_time'):
-                    self.tracker.stuck_start_time = None
-            
-            self.pause_start_time = None  # Limpio para próxima pausa
-            
-            # Impulso inteligente después de pausa en coro
-                     # Impulso suave después de pausa en coro
-            if self.tracker.is_current_slide_duplicated() and self.tracker.coro_fase >= 1:
-                half = self.tracker.get_duplication_split_point()
-                if self.tracker.current_word_index < half and self.tracker.current_word_index > int(half * 0.4):
-                    print("Impulso suave después de pausa → Ayudando a cruzar")
-                    self.tracker.coro_fase = 2
-                    self.tracker.coro_crossed = True
-                    self.tracker.current_word_index = half
-                
     def _main_loop_with_denoising(self):
         global _system_running
         last_processing_time = 0
         audio_buffer = b""
         buffer_size = 1
 
-
         while _system_running and self.is_listening:
-            if getattr(getattr(self, 'processor', None), 'is_paused', False):
-                time.slep(0.1)
-                continue
             try:
                 current_time = time.time()
 
@@ -306,24 +241,24 @@ class BalancedAudioProcessor:
                 # Procesar cuando tengamos suficiente audio
                 if (len(audio_buffer) >= self.chunk_size * buffer_size or
                     current_time - last_processing_time >= self.processing_interval):
+
                     process_start = time.time()
-                    try:
-                        if _system_running and self.recognizer.AcceptWaveform(audio_buffer):
-                            result = json.loads(self.recognizer.Result())
-                            text = result.get('text', '').strip()
-                            if text:
-                                print(f"{text}")
-                                self._process_text_for_advance(text)
-                        if _system_running:
-                            partial = json.loads(self.recognizer.PartialResult())
-                            partial_text = partial.get('partial', '').strip()
-                            if partial_text:
-                                self._process_text_for_advance(partial_text, is_partial=True)
-                    except Exception as e:
-                        if "waveform" in str(e).lower():
-                            pass  # Ignorar error de waveform vacío durante pausa
-                        else:
-                            print(f"Error Vosk: {e}")
+
+                    # Resultado completo
+                    if _system_running and self.recognizer.AcceptWaveform(audio_buffer):
+                        result = json.loads(self.recognizer.Result())
+                        text = result.get('text', '').strip()
+                        if text:
+                            print(f"{text}")
+                            self._process_text_for_advance(text)
+
+                    # Resultados parciales (la magia del adelanto)
+                    if _system_running:
+                        partial = json.loads(self.recognizer.PartialResult())
+                        partial_text = partial.get('partial', '').strip()
+                        if partial_text: 
+                            self._process_text_for_advance(partial_text, is_partial=True)
+
                     audio_buffer = b""
                     last_processing_time = current_time
 
@@ -398,10 +333,7 @@ class BalancedAudioProcessor:
             # 4. Convertir a int16 y bytes
             audio_int16 = (audio_16k * 32767).astype(np.int16)
             audio_bytes = audio_int16.tobytes()
-            if hasattr(self, 'preprocess_audio'):  # Seguridad por si no está definida
-                processed_bytes = self.preprocess_audio(audio_bytes, sample_rate=16000)
-            else:
-                processed_bytes = audio_bytes  # fallback
+            
             try:
                 self.audio_queue.put_nowait(audio_bytes)
             except queue.Full:
@@ -460,30 +392,7 @@ class BalancedAudioProcessor:
         print("Sistema detenido correctamente")
 
 
-    
-    def preprocess_audio(self, chunk: bytes, sample_rate: int = 16000) -> bytes:
-        """
-        Procesa un chunk de audio crudo (bytes) con pedalboard.
-        """
-        audio_array = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-        
-        if len(audio_array.shape) == 1:
-            audio_array = audio_array[:, np.newaxis]
 
-        board = Pedalboard([
-            NoiseGate(threshold_db=-42.0, ratio=10.0, attack_ms=2.0, release_ms=150.0),
-            LowShelfFilter(cutoff_frequency_hz=120, gain_db=+2.0, q=1.0),
-            PeakFilter(cutoff_frequency_hz=3500, gain_db=+5.0, q=1.4),
-            PeakFilter(cutoff_frequency_hz=8000, gain_db=+4.0, q=2.0),
-            Compressor(threshold_db=-25.0, ratio=3.0, attack_ms=10.0, release_ms=100.0),
-            Compressor(threshold_db=-22.0, ratio=4.0, attack_ms=5.0, release_ms=80.0),
-            Compressor(threshold_db=-20.0, ratio=5.0, attack_ms=3.0, release_ms=60.0),
-            Gain(gain_db=0.0)
-        ])
-
-        processed_array = board(audio_array, sample_rate)
-        processed_int16 = (processed_array * 32768.0).clip(-32768, 32767).astype(np.int16)
-        return processed_int16.tobytes()
         
     def _process_commands_and_tracking(self, text):
         if not hasattr(self, '_last_command_time'):
@@ -512,12 +421,13 @@ class BalancedAudioProcessor:
         short_words = ['atrás', 'no', 'si', 'ya', 'ok']
         if text_lower in short_words and len(text_lower) < 4:
             return False
-        """
-          if any(cmd in text_lower for cmd in ["repetir", "otra vez", "repite"]):
+
+        if any(cmd in text_lower for cmd in ["repetir", "otra vez", "repite"]):
             print("🔄 Comando: REPETIR")
             self._go_back_slide()
             return True
-            elif any(cmd in text_lower for cmd in ["atrás", "volver", "anterior", "retrocede"]):
+
+        elif any(cmd in text_lower for cmd in ["atrás", "volver", "anterior", "retrocede"]):
             print("🔙 Comando: VOLVER")
             self._go_back_slide()
             return True
@@ -534,10 +444,6 @@ class BalancedAudioProcessor:
                 self._go_to_slide(slide_num)
                 return True
 
-        """
-      
-
-        
         return False
 
     def _detect_early_transition(self, text):
@@ -579,14 +485,14 @@ class BalancedAudioProcessor:
             app = win32com.client.Dispatch("PowerPoint.Application")
             view = app.ActivePresentation.SlideShowWindow.View
             
-            # NUEVO: Verificamos si realmente hay siguiente slide
-            if not self.tracker.next_slide():
-                # No hay más slides → marcamos terminada y no avanzamos PowerPoint
+            next_slide_num = self.tracker.current_slide + 1
+            next_key = f"slide_{next_slide_num}"
+            if next_key not in self.tracker.lyrics_data:
                 if not self.song_finished:
                     print("¡CANCIÓN TERMINADA! Gracias Jesús")
                     self.song_finished = True
                     self._go_to_black_slide()
-                return  # Salimos sin avanzar
+                return  # ¡No avanzar nunca más!
 
             view.Next()
             print("SLIDE AVANZADO CON COM → 100% garantizado")
