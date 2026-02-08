@@ -78,3 +78,4 @@ config.local.json
 *_lyrics.json
 corpus_cristiano.txt
 *.txt
+!requirements.txt
