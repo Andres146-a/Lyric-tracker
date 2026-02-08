@@ -70,6 +70,11 @@ data/
 .DS_Store
 Thumbs.db
 
-# Configuración local
+# Configuraciï¿½n local
 config.local.json
 .env.local
+
+# Dataset lyric tracker
+*_lyrics.json
+corpus_cristiano.txt
+*.txt

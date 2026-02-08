@@ -1,78 +1,325 @@
 import json
 import time
 import re
-from difflib import SequenceMatcher
 
+import jellyfish 
 class LyricTracker:
-    def __init__(self, lyrics_data):
-        self.lyrics_data = lyrics_data
-        self.current_slide = 2
+    def __init__(self, lyrics_data, start_slide=None):
+        self.stuck_position = 0
+        self.coro_fase = 0          # 0=normal | 1=primera rep | 2=segunda rep
+        self.coro_crossed = False  # evita repetir el cruce del //
+        self._just_reloaded = False  # Flag para ignorar sincronización inmediata
+        self.last_strong_word_time = time.time()
+        self.start_time = time.time()
+        
+        # ✅ CONVERTIR AUTOMÁTICAMENTE a formato compatible
+        self.lyrics_data = self._convert_to_universal_format(lyrics_data)
+        
+        # ✅ DETECTAR PRIMER SLIDE DISPONIBLE
+        available_slides = []
+        for key in self.lyrics_data.keys():
+            if key.startswith("slide_"):
+                try:
+                    num = int(key.replace("slide_", ""))
+                    available_slides.append(num)
+                except ValueError:
+                    continue
+        
+        if available_slides:
+            first_slide = min(available_slides)
+        else:
+            first_slide = 1
+        
+        # ✅ USAR start_slide SI SE PROVEE, SINO EL PRIMERO DISPONIBLE
+        if start_slide is not None:
+            self.current_slide = start_slide
+        else:
+            self.current_slide = first_slide
+            
+        print(f"🎯 Slide inicial configurado: {self.current_slide} (slides disponibles: {sorted(available_slides)})")
+        
         self.current_word_index = 0
         self.is_tracking = False
-        
+        self.preloaded_slides = {}
+        self.start_time = time.time()
+        self.last_progress_time = time.time()
+        self.stuck_start_time = None
+        self.stuck_position = 0
+        self.coro_repetido_detectado = False
+        self.aplausos_detectados = 0
+        self.last_slide_change_time = time.time()
+        self.recent_progress = 0.0
+        self.song_data = {}  # ← Esto también falta, lo necesitas para _is_problematic_song()
+
         # CARGAR CONFIGURACIÓN
         self.config = self._load_config()
         
-        # Cache de palabras y DETECCIÓN DE ESTRUCTURA
+        # Cache de palabras y DETECCIÓN DE ESTRUCTURA MEJORADA
         self.slide_words_cache = {}
-        self.common_patterns = self._build_common_patterns()
+        self.slide_metadata = {}
         self.slide_structures = self._analyze_slide_structures()
         self._build_words_cache()
+        self.current_slide_metadata = None
+        self._preload_slides_ahead(3)
+        
+        print("🎵 Motor FASE 1.5 - Formato Universal (Nuevo + Viejo)")
 
-        print("🎵 Motor con detección de estructura duplicada")
-    def _build_common_patterns(self):
-        """Patrones comunes de reconocimiento erróneo"""
-        return {
-            r'enero': 'quiero',
-            r'hielo': 'lo', 
-            r've\s*to\s*da': 'toda',
-            r'sus': 'jesús',
-            r'misma': 'mis',
-            r'nos': 'manos',
-            r'hará': 'harás',
-            r'precio': 'precioso',
-            r'glory': 'gloria'
-        }
+    def _convert_to_universal_format(self, lyrics_data):
+        """
+        Convierte CUALQUIER formato al formato que LyricTracker entiende:
+        { "slide_1": ["palabra1", "palabra2", ...] }
+        """
+        universal_format = {}
+        
+        print("🔄 Analizando estructura de datos...")
+        
+        # CASO 1: Es una LISTA (formato muy viejo)
+        if isinstance(lyrics_data, list):
+            print("📋 Convertiendo LISTA → DICCIONARIO")
+            for i, item in enumerate(lyrics_data, 1):
+                key = f"slide_{i}"
+                if isinstance(item, dict) and "processed_text" in item:
+                    universal_format[key] = item["processed_text"]
+                elif isinstance(item, list):
+                    universal_format[key] = item
+                else:
+                    universal_format[key] = []
+        
+        # CASO 2: Es un DICCIONARIO (formato nuevo o viejo)
+        elif isinstance(lyrics_data, dict):
+            print("✅ USANDO DICCIONARIO EXISTENTE...")
+            for key, value in lyrics_data.items():
+                # ✅ PRESERVAR EL NOMBRE ORIGINAL DEL SLIDE
+                if isinstance(value, dict):
+                    if "processed_text" in value:
+                        universal_format[key] = value["processed_text"]
+                    else:
+                        universal_format[key] = value
+                else:
+                    universal_format[key] = value
+        
+        print(f"✅ Conversión completada: {len(universal_format)} slides")
+        print(f"📋 Slides resultantes: {list(universal_format.keys())}")
+        return universal_format
+
+
+
+    def _preload_slides_ahead(self, slides_ahead=3):
+        """Pre-carga múltiples slides hacia adelante"""
+        for i in range(1, slides_ahead + 1):
+            slide_num = self.current_slide + i
+            slide_key = f"slide_{slide_num}"
+            
+            if slide_key in self.slide_words_cache:
+                self.preloaded_slides[slide_num] = {
+                    'words': self.slide_words_cache[slide_key],
+                    'metadata': self.slide_metadata.get(slide_key, [])
+                }
+        print(f"🔮 Pre-cargados {slides_ahead} slides adelante")
+
+    def previous_slide(self):
+        """Para cuando presiones tecla de retroceder"""
+        if self.current_slide > 1:
+            self.current_slide -= 1
+            self.current_word_index = 0
+            self.force_reload_current_slide(reset_progress=True)  # ← QUITA self.tracker. y pon reset_progress=True
+            print(f"← RETROCESO MANUAL → Slide {self.current_slide} recargado 100% limpio")
+            self._preload_slides_ahead(3)
+            return True
+        else:
+            print("Ya estás en el primer slide")
+            return False
+
+    def next_slide(self):
+        next_slide_num = self.current_slide + 1
+        next_key = f"slide_{next_slide_num}"
+        
+        if next_key not in self.lyrics_data:
+            # No hay más slides → NO aumentamos current_slide
+            print("🎉 FIN DE CANCIÓN DETECTADO - Manteniendo slide actual (no hay slide siguiente)")
+            # Opcional: marcar canción terminada aquí si quieres
+            return False  # Indica que no hay siguiente
+        
+        # Si hay slide siguiente, procedemos normal
+        self.current_slide = next_slide_num
+        self.current_word_index = 0
+        self.last_slide_change_time = time.time()
+        self.force_reload_current_slide(reset_progress=True)
+        slide_key = f"slide_{self.current_slide}"
+        self.current_slide_metadata = self.slide_metadata.get(slide_key, [])
+        print(f"→ Slide {self.current_slide} cargado LIMPIO y listo para cantar desde aquí")
+        self._preload_slides_ahead(3)
+        return True
+
+    def force_reload_current_slide(self, reset_progress=False):
+        """
+        Fuerza recarga completa del slide actual.
+        reset_progress = True SOLO cuando hay cambio real de slide.
+        """
+        slide_key = f"slide_{self.current_slide}"
+        # Limpiar caché viejo
+        self.slide_words_cache.pop(slide_key, None)
+        self.slide_metadata.pop(slide_key, None)
+        self.preloaded_slides.pop(self.current_slide, None)
+        
+        # Reconstruir desde cero con normalización completa
+        words = self.lyrics_data.get(slide_key, [])
+        metadata_words = []
+        content_words = []
+        for word in words:
+            if isinstance(word, str) and (
+                word.startswith("DUPLICADO") or
+                word.startswith("MITAD") or
+                "MITAD1" in word
+            ):
+                metadata_words.append(word)
+            else:
+                cleaned = word.lower()
+                cleaned = cleaned.replace('á','a').replace('é','e').replace('í','i').replace('ó','o').replace('ú','u')
+                cleaned = re.sub(r'[^a-z]', '', cleaned)
+                if cleaned:
+                    content_words.append(cleaned)
+        self.slide_words_cache[slide_key] = content_words
+        self.slide_metadata[slide_key] = metadata_words
+        self.current_slide_metadata = metadata_words
+        print(
+            f"RECARGA FORZADA slide {self.current_slide} → "
+            f"{len(content_words)} palabras listas (normalizadas)"
+        )
+        
+        # Gestión del estado del coro
+                # Gestión del estado del coro
+        if reset_progress:
+            self.current_word_index = 0
+            self.last_progress_time = time.time()
+            self.coro_crossed = False  # Limpieza importante
+            if self.is_current_slide_duplicated():
+                self.coro_fase = 1
+                print("🎵 CORO DETECTADO → Fase 1 iniciada")
+            else:
+                self.coro_fase = 0
+        else:
+            if self.is_current_slide_duplicated():
+                half_point = self.get_duplication_split_point()
+                
+                if self.coro_fase == 0:
+                    self.coro_fase = 1
+                    self.coro_crossed = False
+                    print("🎵 CORO RECARGADO → Restaurando Fase 1")
+                
+                # Impulso suave si ya estábamos avanzados
+                if self.current_word_index >= int(half_point * 0.5):
+                    print("🎵 CORO RECARGADO → Impulso suave a Fase 2")
+                    self.coro_fase = 2
+                    self.coro_crossed = True
+                    self.current_word_index = max(self.current_word_index, half_point)
+                
+                print("🎵 CORO RECARGADO → Manteniendo progreso actual")
+
+
 
     def _analyze_slide_structures(self):
-        """Analiza la estructura de cada slide para detectar duplicaciones"""
+        """Analiza duplicados - COMPATIBLE CON AMBOS FORMATOS"""
         structures = {}
         
-        for slide_key, data in self.lyrics_data.items():
-            words = data.get("processed_text", [])
-            total_words = len(words)
+        for slide_key, words in self.lyrics_data.items():
+            # ✅ words ya es una lista limpia gracias a _convert_to_universal_format
             
-            # Buscar patrones de repetición dentro del slide
+            total_words = len(words)
+            if total_words < 8:
+                continue
+
+            # Buscar marcador de duplicado en metadatos (si existen en formato original)
+            has_duplication_marker = any(
+                isinstance(w, str) and ("MITAD1" in w or "DUPLICADO" in w)
+                for w in words
+            )
+            
+            if has_duplication_marker:
+                split_point = self._extract_split_point_from_metadata(words)
+                structures[slide_key] = {
+                    'type': 'duplicated',
+                    'half_point': split_point,
+                    'similarity': 1.0,
+                    'total_words': total_words,
+                    'source': 'metadata'
+                }
+                print(f"Slide duplicado por metadatos: {slide_key} (split en {split_point})")
+                continue
+
+            # Detección automática por similitud
             if total_words > 10:
-                # Dividir en mitades para comparar
                 mid_point = total_words // 2
-                first_half = words[:mid_point]
-                second_half = words[mid_point:]
+                first_half = [w.lower() if isinstance(w, str) else str(w) for w in words[:mid_point]]
+                second_half = [w.lower() if isinstance(w, str) else str(w) for w in words[mid_point:]]
                 
-                # Calcular similitud entre mitades
                 similarity = self._calculate_similarity(first_half, second_half)
-                
-                if similarity > 0.7:  # Si son más del 70% similares
+                if similarity > 0.75:
                     structures[slide_key] = {
                         'type': 'duplicated',
                         'half_point': mid_point,
                         'similarity': similarity,
-                        'total_words': total_words
+                        'total_words': total_words,
+                        'source': 'auto_detected'
                     }
-                    print(f"🔄 Slide duplicado detectado: {slide_key} ({similarity:.0%} similitud)")
+                    print(f"Slide duplicado detectado: {slide_key} ({similarity:.0%} similitud)")
                     
         return structures
+    def _extract_split_point_from_metadata(self, words):
+        """Extrae el punto de división desde metadatos existentes"""
+        for word in words:
+            if isinstance(word, str) and word.startswith("🔄MITAD1:"):
+                try:
+                    return int(word.split(":")[1])
+                except:
+                    pass
+        return len(words) // 2
 
-    def _calculate_similarity(self, list1, list2):
-        """Calcula similitud entre dos listas de palabras"""
-        if len(list1) != len(list2):
-            return 0
+    def _build_words_cache(self):
+        """Cache con normalización COMPLETA de acentos"""
+        for slide_key, words in self.lyrics_data.items():
+            metadata_words = []
+            content_words = []
             
-        matches = sum(1 for a, b in zip(list1, list2) if a == b)
-        return matches / len(list1)
+            for word in words:
+                if isinstance(word, str) and (
+                    word.startswith("DUPLICADO") or 
+                    word.startswith("MITAD") or 
+                    "MITAD1" in word
+                ):
+                    metadata_words.append(word)
+                else:
+                    cleaned = word.lower()
+                    cleaned = cleaned.replace('á','a').replace('é','e').replace('í','i').replace('ó','o').replace('ú','u')
+                    cleaned = re.sub(r'[^a-z]', '', cleaned)
+                    if cleaned:
+                        content_words.append(cleaned)
+            
+            self.slide_words_cache[slide_key] = content_words
+            self.slide_metadata[slide_key] = metadata_words
 
+   
+    def get_current_slide_text(self):
+        """Obtiene solo el contenido (sin metadatos) - 100% compatible"""
+        slide_key = f"slide_{self.current_slide}"
+        return self.slide_words_cache.get(slide_key, [])
 
+    def get_current_slide_metadata(self):
+        """Obtiene metadatos del slide actual"""
+        slide_key = f"slide_{self.current_slide}"
+        return self.slide_metadata.get(slide_key, [])
 
+    def is_current_slide_duplicated(self):
+        """Detecta si el slide actual tiene contenido duplicado"""
+        slide_key = f"slide_{self.current_slide}"
+        return slide_key in self.slide_structures
+
+    def get_duplication_split_point(self):
+        """Obtiene el punto de división para slides duplicados"""
+        slide_key = f"slide_{self.current_slide}"
+        if slide_key in self.slide_structures:
+            return self.slide_structures[slide_key]['half_point']
+        return len(self.get_current_slide_text()) // 2
 
     def _load_config(self):
         """Carga configuración desde JSON"""
@@ -94,315 +341,390 @@ class LyricTracker:
                     "progress_threshold_short": 0.80,
                     "progress_threshold_long": 0.75,
                     "remaining_words_short": 2,
-                    "remaining_words_long": 3
+                    "remaining_words_long": 3,
+                    "duplicated_second_half_threshold": 0.70
                 }
             }
-
-    def _build_words_cache(self):
-        """Pre-cache de palabras"""
-        for slide_key in self.lyrics_data:
-            self.slide_words_cache[slide_key] = self.lyrics_data[slide_key]["processed_text"]
-        print(f"📦 Cache construido: {len(self.slide_words_cache)} slides")
-
-    def get_current_slide_text(self):
-        slide_key = f"slide_{self.current_slide}"
-        return self.slide_words_cache.get(slide_key, [])
-
+# Pseudo-código para tu BalancedAudioProcessor
+    def preprocess_audio(chunk):
+        # 1. Normalizar volumen (evita clipping en voces fuertes masculinas)
+        chunk = normalize_rms(chunk, target_rms=-18)
+        
+        # 2. EQ paramétrico balanceado
+        # Boost suave en medios-altos para mujeres + preservación graves
+        eq = parametric_eq(chunk,
+                        bands=[
+                            {'freq': 120,  'gain': +2,   'q': 1.0},   # graves cálidos (hombres)
+                            {'freq': 3500, 'gain': +5,   'q': 1.4},   # presencia/claridad
+                            {'freq': 8000, 'gain': +4,   'q': 2.0}    # aire para voces agudas
+                        ])
+        
+        # 3. Compresión multibanda (más suave en graves)
+        comp = multiband_compressor(eq,
+                                    low_threshold=-25, low_ratio=3,
+                                    mid_threshold=-22, mid_ratio=4,
+                                    high_threshold=-20, high_ratio=5)
+        
+        # 4. Noise gate + reducción de ruido ligera
+        gated = noise_gate(comp, threshold=-42, ratio=10)
+        denoised = webrtc_ns(gated)  # o rnnoise si tienes mejor integración
+        
+        return denoised
     def _preprocess_recognized_text(self, text):
-        """CORRECCIÓN DE PALABRAS COMUNMENTE MAL RECONOCIDAS"""
+        """Preprocesamiento mínimo y escalable"""
         if isinstance(text, list):
             text = ' '.join(text)
-            
-        text_lower = text.lower()
         
-        # Aplicar correcciones de patrones
-        for pattern, correction in self.common_patterns.items():
-            text_lower = re.sub(pattern, correction, text_lower)
-            
+        # ✅ SOLO normalización básica, NO correcciones específicas
+        text_lower = text.lower().strip()
+        
+        # Solo aplicar normalizaciones fonéticas universales
+        basic_normalizations = {
+            'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
+            'ü': 'u'
+        }
+        
+        for old, new in basic_normalizations.items():
+            text_lower = text_lower.replace(old, new)
+                
         return text_lower.split()
 
-    def process_recognized_text(self, recognized_text):
-        words = self._preprocess_recognized_text(recognized_text)
+    def _detectar_repeticion_frase(self):
+        metadata = self.get_current_slide_metadata()
+        for m in metadata:
+            if m.startswith("REPITE_ULTIMA_FRASE:"):
+                return int(m.split(":")[1])
+            if m.startswith("FRASE_REPETIDA:"):
+                self.frase_a_repetir = m.split(":",1)[1].strip().split()
+        return 0
+    
+    def _calculate_levenshtein(self, s1, s2):
+        """Calcula distancia de Levenshtein optimizada"""
+        if len(s1) < len(s2):
+            return self._calculate_levenshtein(s2, s1)
         
-        current_slide_words = self.get_current_slide_text()
-        if not current_slide_words or self.current_word_index >= len(current_slide_words):
-            return "CONTINUE"
+        if len(s2) == 0:
+            return len(s1)
+        
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        
+        return previous_row[-1]
 
-        # DETECTAR TIPO DE SLIDE
-        slide_key = f"slide_{self.current_slide}"
-        slide_structure = self.slide_structures.get(slide_key, {})
-        is_duplicated_slide = slide_structure.get('type') == 'duplicated'
-        half_point = slide_structure.get('half_point', 0)
+    def _phonetic_similarity(self, word1, word2):
+        """Similaridad fonética basada en reglas del español"""
         
-        # NUEVO: Detectar si estamos atascados
-        current_stuck_position = self.current_word_index
+        # Reglas fonéticas del español
+        phonetic_rules = [
+            # Confusiones comunes de consonantes
+            (['b', 'v'], 'b'),
+            (['s', 'c', 'z'], 's'), 
+            (['j', 'g'], 'h'),
+            (['y', 'll'], 'y'),
+            (['r', 'rr'], 'r'),
+        ]
         
-        if len(words) > 0:
-            expected_preview = current_slide_words[self.current_word_index:min(self.current_word_index+3, len(current_slide_words))]
-            current_progress = f"{self.current_word_index}/{len(current_slide_words)}"
+        def apply_phonetic_rules(word):
+            result = word.lower()
+            for group, replacement in phonetic_rules:
+                for sound in group:
+                    result = result.replace(sound, replacement)
+            return result
+        
+        phonetic1 = apply_phonetic_rules(word1)
+        phonetic2 = apply_phonetic_rules(word2)
+        
+        return phonetic1 == phonetic2
+
+
+    
+
+   
+
+
+    def _context_aware_matching(self, recognized_words, current_slide_words, current_position):
+        """Matching contextual CONSERVADOR - solo salta si hay buena coincidencia"""
+        if current_position >= len(current_slide_words):
+            return None, current_position
             
-            structure_flag = ""
-            if is_duplicated_slide:
-                if self.current_word_index < half_point:
-                    structure_flag = " 🔄(1ª mitad)"
-                else:
-                    structure_flag = " 🔄(2ª mitad)"
+        max_search_distance = 5  # máximo 5 palabras adelante
+        
+        for rec_word in recognized_words:
+            for offset in range(1, max_search_distance + 1):
+                ctx_pos = current_position + offset
+                if ctx_pos >= len(current_slide_words):
+                    break
                     
-            print(f"🔍 '{' '.join(words[:3])}...' → [{current_progress}]{structure_flag} {expected_preview}...")
+                ctx_word = current_slide_words[ctx_pos]
+                
+                # Matching estricto: solo salta si es muy buena coincidencia
+                if (jellyfish.soundex(rec_word) == jellyfish.soundex(ctx_word) and
+                    jellyfish.levenshtein_distance(rec_word, ctx_word) <= 1):
+                    
+                    print(f"CONTEXTUAL SALTO SEGURO +{offset}: '{rec_word}' → '{ctx_word}'")
+                    return ctx_word, ctx_pos + 1
+        
+        return None, current_position
+    
 
-        words_processed = 0
-        used_words = set()
 
+    
+    def _sync_from_anywhere(self, recognized_words, current_slide_words):
+        """Busca palabras clave fuertes del slide y sincroniza desde cualquier parte"""
+        # Palabras clave fuertes del slide actual (las que más se repiten o son únicas)
+        key_words = []
+        for i, word in enumerate(current_slide_words):
+            if word in ["jesus", "senor", "creo", "poder", "gloria", "recibe", "manos", "levanta", "presencia", "aqui"]:
+                key_words.append((word, i))
+        
+        for rec_word in recognized_words:
+            for key, pos in key_words:
+                if (jellyfish.soundex(rec_word) == jellyfish.soundex(key) or
+                    jellyfish.levenshtein_distance(rec_word, key) <= 1):
+                    if pos > self.current_word_index:
+                        print(f"SINCRONIZACIÓN SEGURA: '{rec_word}' → '{key}' en posición {pos}")
+                        self.current_word_index = pos + 1
+                        return True
+        return False
+
+    
+
+    def process_recognized_text(self, recognized_text):
+        # Normalización
+        text = recognized_text.lower().strip()
+        text = text.replace('á','a').replace('é','e').replace('í','i').replace('ó','o').replace('ú','u')
+        text = re.sub(r'[^a-z\s]', ' ', text)
+        if len(text) < 3:
+            return "CONTINUE"
+        words = [w for w in text.split() if len(w) > 1]
+        if not words:
+            return "CONTINUE"
+        
+        current_slide_words = [
+            w.lower().replace('á','a').replace('é','e').replace('í','i').replace('ó','o').replace('ú','u')
+            for w in self.get_current_slide_text()
+        ]
+        old_index = self.current_word_index
+        
+        # Matching normal
         for word in words:
             if self.current_word_index >= len(current_slide_words):
                 break
-
-            if word in used_words:
-                continue
-            used_words.add(word)
-
-            expected_word = current_slide_words[self.current_word_index]
-
-            # ESTRATEGIA 1: Coincidencia exacta
-            if word == expected_word:
-                print(f"✅ '{word}' → pos {self.current_word_index}")
+            expected = current_slide_words[self.current_word_index]
+            if (
+                jellyfish.soundex(word) == jellyfish.soundex(expected) or
+                jellyfish.levenshtein_distance(word, expected) <= 2 or
+                expected in word or
+                word in expected or
+                word[:3] == expected[:3]
+            ):
                 self.current_word_index += 1
-                words_processed += 1
-                continue
-
-            # ESTRATEGIA 2: Coincidencia por similitud (MEJORADA)
-            elif self._words_similar_optimized(word, expected_word):
-                print(f"⚠️ '{word}' ≈ '{expected_word}' → pos {self.current_word_index}")
-                self.current_word_index += 1
-                words_processed += 1
-                continue
-
-            # ESTRATEGIA 3: Búsqueda adelantada CONTROLADA
-            if is_duplicated_slide:
-                if self.current_word_index < half_point:
-                    max_lookahead = half_point - self.current_word_index - 1
-                    look_ahead = min(4, max_lookahead)
-                else:
-                    look_ahead = 6
-            else:
-                look_ahead = 10
+        
+        # Sincronización segura
+        if (
+            not self.is_current_slide_duplicated() and
+            self.current_word_index < len(current_slide_words) * 0.4
+        ):
+            self._sync_from_anywhere(words, current_slide_words)
+        
+        if getattr(getattr(self, 'processor', None), 'is_paused', False):
+            return "CONTINUE"
+        
+        # === Anti-stuck por tiempo (DESACTIVADO EN COROS) ===
+        tiempo_sin_avance = time.time() - self.last_progress_time
+        if (
+            not self.is_current_slide_duplicated() and
+            len(current_slide_words) > 10 and
+            self.current_word_index > 3 and
+            self.current_word_index == old_index and
+            tiempo_sin_avance > 12.0
+        ):
+            print(f"ANTI-STUCK GLOBAL: {tiempo_sin_avance:.1f}s sin avance → Forzando cambio")
+            return "CHANGE_SLIDE"
+        
+        # Actualiza tiempo si hubo progreso
+        if self.current_word_index > old_index:
+            self.last_progress_time = time.time()
+            if self.is_current_slide_duplicated():
+                progreso_coro = self.current_word_index / len(current_slide_words)
+                print(f"PROGRESO CORO: {self.current_word_index}/{len(current_slide_words)} ({progreso_coro:.0%}) - Fase {self.coro_fase}")
+        
+        # === Gestión de coros duplicados (FUERA del if progreso) ===
+        if self.is_current_slide_duplicated():
+            half_point = self.get_duplication_split_point()
+            total_words = len(current_slide_words)
+            
+            # Cruce al 70% de la primera mitad
+            cross_threshold = int(half_point * 0.70)
+            if self.coro_fase == 1 and not self.coro_crossed and self.current_word_index >= cross_threshold:
+                print(f"CRUCE DE CORO → Segunda repetición iniciada (índice {self.current_word_index}/{half_point})")
+                self.coro_fase = 2
+                self.coro_crossed = True
+                self.last_progress_time = time.time()
+            
+            if self.coro_fase == 2:
+                # Avance al 80% del slide total (alcanzable después de recarga)
+                if self.current_word_index >= int(total_words * 0.80):  # ~17/22
+                    print("CORO COMPLETADO → Cambiando al siguiente slide")
+                    self.coro_fase = 0
+                    self.coro_crossed = False
+                    return "CHANGE_SLIDE"
                 
-            if self._look_ahead_match_optimized(word, current_slide_words, look_ahead):
-                words_processed += 1
-                continue
-
-        # NUEVO: LÓGICA MEJORADA DE BLOQUEO Y CAMBIO
-        if words_processed == 0 and self.current_word_index == current_stuck_position:
-            print(f"🔒 Posible bloqueo en posición {self.current_word_index}")
-            
-            # Forzar avance si estamos muy cerca del final de la mitad
-            if is_duplicated_slide and self.current_word_index < half_point:
-                first_half_progress = self.current_word_index / half_point
-                if first_half_progress >= 0.95:  # 95% de la primera mitad
-                    print(f"🎯 Forzando avance por bloqueo al 95% de primera mitad")
-                    self.current_word_index = half_point  # Saltar a segunda mitad
-                    # NUEVO: Cambiar slide inmediatamente si saltamos a la segunda mitad
+                # Anti-stuck sensible (12s)
+                if tiempo_sin_avance > 12.0 and self.current_word_index > half_point:
+                    print("ANTI-STUCK EN CORO → Avanzando tras pausa en segunda repetición")
+                    self.coro_fase = 0
+                    self.coro_crossed = False
                     return "CHANGE_SLIDE"
-
-        # 🎯 LÓGICA DE CAMBIO MEJORADA - MÁS FLEXIBLE
-        if words_processed > 0 or self.current_word_index > current_stuck_position:
-            current_progress_ratio = self.current_word_index / len(current_slide_words)
-            
-            if is_duplicated_slide:
-                if self.current_word_index < half_point:
-                    first_half_progress = self.current_word_index / half_point
-                    # MÁS FLEXIBLE: 85% + 2 palabras o 90% automático
-                    should_change = (first_half_progress >= 0.85 and words_processed >= 2) or (first_half_progress >= 0.90)
-                    change_type = f"PRIMERA MITAD: {first_half_progress:.0%}"
-                    
-                    print(f"📊 Progreso 1ª mitad: {self.current_word_index}/{half_point} = {first_half_progress:.0%}")
-                    
-                else:
-                    second_half_length = len(current_slide_words) - half_point
-                    second_half_progress = (self.current_word_index - half_point) / second_half_length
-                    # MÁS FLEXIBLE: 70% + 1 palabra o 75% automático
-                    should_change = (second_half_progress >= 0.70 and words_processed >= 1) or (second_half_progress >= 0.75)
-                    change_type = f"SEGUNDA MITAD: {second_half_progress:.0%}"
-                    
-                    print(f"📊 Progreso 2ª mitad: {self.current_word_index - half_point}/{second_half_length} = {second_half_progress:.0%}")
-                    
-                if should_change:
-                    print(f"🎯 Cambio {change_type} + {words_processed} palabras")
+        
+        # === AVANCE NATURAL POR PROGRESO DE LETRA (fuera de coros) ===
+        if not self.is_current_slide_duplicated():
+            total = len(current_slide_words)
+            if total > 0:
+                progreso = self.current_word_index / total
+                umbral = 0.75 if total <= 10 else 0.85
+                if progreso >= umbral:
+                    print(f"🎶 Fin de slide detect. por progreso ({progreso:.0%}, umbral {umbral:.0%}) → Avanzando")
                     return "CHANGE_SLIDE"
-                    
-            else:
-                # SLIDES NORMALES: COMPORTAMIENTO ORIGINAL
-                change_threshold = self.config["tracking"].get("early_change_ratio", 0.70)
-                if current_progress_ratio >= change_threshold and words_processed >= 2 and self.should_change_slide_optimized():
-                    print(f"🎯 Cambio NORMAL: {current_progress_ratio:.0%} + {words_processed} palabras")
-                    return "CHANGE_SLIDE"
+        
+        return "PROGRESS" if self.current_word_index > old_index else "CONTINUE"
 
-        return "CONTINUE" if words_processed == 0 else "PROGRESS"
-    def _check_second_half_completion(self):
-        """Verifica si la segunda mitad está suficientemente avanzada - CORREGIDO"""
-        slide_key = f"slide_{self.current_slide}"
-        slide_structure = self.slide_structures.get(slide_key, {})
-        half_point = slide_structure.get('half_point', 0)
-        
-        current_slide_words = self.get_current_slide_text()
-        
-        # Si ya estamos en la segunda mitad, verificar progreso
-        if self.current_word_index >= half_point:
-            second_half_length = len(current_slide_words) - half_point
-            second_half_progress = (self.current_word_index - half_point) / second_half_length
+    def _calculate_optimal_lookahead(self, is_duplicated, half_point):
+        """Lookahead óptimo"""
+        if not is_duplicated:
+            return 8
             
-            print(f"📊 Verificación 2ª mitad: {self.current_word_index - half_point}/{second_half_length} = {second_half_progress:.0%}")
-            
-            # Si el progreso es suficiente, cambiar slide
-            if second_half_progress >= 0.70:
-                return True
-        
+        if self.current_word_index < half_point:
+            remaining_in_first_half = half_point - self.current_word_index - 1
+            return min(3, remaining_in_first_half)
+        else:
+            return 6
+
+    def _should_change_slide_advanced(self, **kwargs):
+    # Ya no se usa → todo el control está ahora en process_recognized_text con el 78%
         return False
 
-    def _words_similar_optimized(self, word1, word2):
-            """Usar min_word_length de configuración - MEJORADO PARA ACENTOS"""
-            min_length = self.config["tracking"].get("min_word_length", 2)
-            
-            if len(word1) < min_length or len(word2) < min_length:
-                return False
 
-            # NUEVO: Normalizar palabras (quitar acentos para comparación)
-            def normalize_word(word):
-                replacements = {
-                    'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
-                    'ü': 'u', 'ñ': 'n'
-                }
-                normalized = ''.join(replacements.get(c, c) for c in word)
-                return normalized
-
-            word1_norm = normalize_word(word1)
-            word2_norm = normalize_word(word2)
-
-            # PRIMERO: Comparación con normalización
-            if word1_norm == word2_norm:
-                return True
-
-            common_confusions = {
-                'has': 'haz', 'haz': 'has',
-                'mis': 'misma', 'misma': 'mis', 'mi': 'mis',
-                'llene': 'llena', 'llena': 'llene',
-                'nos': 'manos', 'manos': 'nos', 'no': 'manos',
-                'es': 'jesús', 'jesús': 'es', 'sus': 'jesús',
-                # NUEVAS: Confusiones con/sin acento
-                'mi': 'mí', 'mí': 'mi',
-                'tu': 'tú', 'tú': 'tu', 
-                'el': 'él', 'él': 'el',
-                'se': 'sé', 'sé': 'se',
-                'te': 'té', 'té': 'te'
-            }
-
-            if word1 in common_confusions and common_confusions[word1] == word2:
-                return True
-
-            # Coincidencia con normalización
-            if word1_norm[:2] == word2_norm[:2]:
-                return True
-            if word1_norm[-2:] == word2_norm[-2:]:
-                return True
-
-            if word1_norm in word2_norm or word2_norm in word1_norm:
-                return True
-
-            return False
-
-    def _look_ahead_match_optimized(self, word, expected_words, look_ahead=10):
-        """Búsqueda con límite configurable y protección contra saltos grandes"""
-        start_index = self.current_word_index + 1
-        end_index = min(start_index + look_ahead, len(expected_words))
-
-        for i in range(start_index, end_index):
-            expected = expected_words[i]
-            
-            # PROTECCIÓN: No permitir saltos muy grandes (más de 8 palabras)
-            max_jump = 8
-            if (i - self.current_word_index) > max_jump:
-                continue
+    def _is_problematic_song(self):
+        """Detecta SOLO la canción que siempre falla: Ya No Soy Esclavo Del Temor"""
+        # Detectar por contenido del slide actual (más confiable)
+        current_words = " ".join(self.get_current_slide_text()).lower()
+        return any(indicator in current_words for indicator in [
+            "ya no soy esclavo", "esclavo del temor", "envuelves", "melodía", "vientre", "rescataste"
+        ])
                 
-            if word == expected:
-                jump = i - self.current_word_index
-                print(f"🎯 '{word}' = '{expected}' → SALTO +{jump}")
-                self.current_word_index = i + 1
-                return True
-            elif self._words_similar_optimized(word, expected):
-                jump = i - self.current_word_index
-                print(f"🎯 '{word}' ≈ '{expected}' → SALTO +{jump}")
-                self.current_word_index = i + 1
-                return True
-
-        return False
-    
-    def should_change_slide_optimized(self):
-        """UMBRALES PARA SLIDES NORMALES (no duplicados)"""
-        current_slide_words = self.get_current_slide_text()
-        if not current_slide_words:
-            return False
-
-        # Solo aplicar para slides no duplicados
-        slide_key = f"slide_{self.current_slide}"
-        if slide_key in self.slide_structures:
-            return False  # Los slides duplicados usan su propia lógica
-
-        words_remaining = len(current_slide_words) - self.current_word_index
-        progress_ratio = self.current_word_index / len(current_slide_words)
-
-        # CONFIGURACIÓN ORIGINAL PARA SLIDES NORMALES
-        long_threshold = self.config["slide_change"].get("long_slide_threshold", 12)
-        progress_short = self.config["slide_change"].get("progress_threshold_short", 0.70)
-        progress_long = self.config["slide_change"].get("progress_threshold_long", 0.65)
-        remaining_short = self.config["slide_change"].get("remaining_words_short", 1)
-        remaining_long = self.config["slide_change"].get("remaining_words_long", 2)
-
-        if len(current_slide_words) > long_threshold:
-            should_change = progress_ratio >= progress_long or words_remaining <= remaining_long
-        else:
-            should_change = progress_ratio >= progress_short or words_remaining <= remaining_short
-
-        if should_change:
-            print(f"🎯 Umbral NORMAL: {progress_ratio:.0%} progreso, {words_remaining} palabras restantes")
-        return should_change
-     
-    def _force_slide_change_check(self):
-        """Usar threshold de configuración"""
-        current_slide_words = self.get_current_slide_text()
-        if not current_slide_words:
-            return False
-
-        force_threshold = self.config["tracking"].get("force_change_threshold", 4)
-        words_remaining = len(current_slide_words) - self.current_word_index
+    def _detect_problematic_song(self, current_slide_words):
+        problematic_keywords = [
+            'envuelves', 'melodía', 'esclavo', 'temor', 'vientre',
+            'rescataste', 'rodeado', 'abriste', 'liberados', 'melodia', 'cancion'
+        ]
+        matches = sum(1 for word in current_slide_words if any(k in word.lower() for k in problematic_keywords))
+        return matches >= 2
         
-        if words_remaining <= force_threshold:
-            print(f"🎯 Forzando cambio por {words_remaining} palabras restantes")
-            return True
-
+    def _simple_look_ahead(self, word, word_list, max_jump=5):
+        """Look-ahead pequeño y seguro solo en la segunda mitad del slide"""
+        start = self.current_word_index + 1
+        end = min(start + max_jump, len(word_list))
+        for i in range(start, end):
+            expected = word_list[i]
+            if (word == expected or 
+                word == expected.replace('í','i').replace('ó','o').replace('á','a').replace('é','e').replace('ú','u')):
+                jump = i - self.current_word_index
+                self.current_word_index = i + 1
+                print(f"Look-ahead +{jump}: '{word}' → posición {i+1}")
+                return True
         return False
-    def next_slide(self):
-        """Avanza al siguiente slide OPTIMIZADO"""
-        self.current_slide += 1
-        self.current_word_index = 0
+   
 
-        slide_key = f"slide_{self.current_slide}"
-        if slide_key in self.slide_words_cache:
-            print(f"🔄 Cambiando a Slide {self.current_slide} (OPTIMIZADO)")
-            # OPTIMIZACIÓN: Preview más corto
-            next_words = self.get_current_slide_text()
-            preview = ' '.join(next_words[:3]) + '...'  # ← REDUCIDO de 5 a 3
-            print(f"📝 Siguiente: {preview}")
-            return True
-        else:
-            print("🎉 ¡Presentación completada!")
-            return False
+    def _calculate_similarity(self, list1, list2):
+        """Calcula similitud entre dos listas de palabras"""
+        if len(list1) != len(list2):
+            return 0
+            
+        matches = sum(1 for a, b in zip(list1, list2) if a == b)
+        return matches / len(list1)
+
+    def _get_current_recognized_words(self):
+        """Método auxiliar para obtener palabras reconocidas actuales"""
+        # Por ahora retornar lista vacía - es solo para logging
+        return []
+
     def reset_tracking(self, slide_number=2):
-        """Reinicia el seguimiento OPTIMIZADO"""
+        """Reinicia el seguimiento"""
         self.current_slide = slide_number
         self.current_word_index = 0
-        print(f"🔄 Seguimiento reiniciado al Slide {slide_number} (OPTIMIZADO)")
+        print(f"🔄 Seguimiento reiniciado al Slide {slide_number}")
 
-    # Los métodos next_slide, reset_tracking se mantienen igual
+    def _detectar_aplausos_o_gritos(self, text):
+            """Detecta gritos de alabanza típicos"""
+            triggers = [
+                "gloria", "aleluya", "jesús", "amen", "santo", "poderoso",
+                "victoria", "libertad", "fuego", "¡gloria!", "¡aleluya!"
+            ]
+            text_lower = text.lower()
+            count = sum(1 for t in triggers if t in text_lower)
+            if count >= 2:
+                self.aplausos_detectados += count
+                if self.aplausos_detectados >= 3:
+                    print("¡APLAUSOS/GRITOS DETECTADOS! → Forzando cambio")
+                    return True
+            return False
+
+    def _ignicion_rapida(self):
+        """
+        Ignición inteligente y escalable:
+        - Solo activa en los primeros 4 slides
+        - El tiempo de tolerancia crece según el slide actual (más paciencia al avanzar)
+        - Solo dispara si NO ha habido progreso real en mucho tiempo
+        """
+        if self.current_slide > 4:
+            return None  # Ya estamos en el cuerpo de la canción → no forzar nunca
+
+        if self.current_word_index > 5:
+            return None  # Ya avanzó un poco → todo bien
+
+        tiempo_desde_ultimo_progreso = time.time() - self.last_progress_time
+
+        # Tolerancia dinámica: cuanto más avanzado el slide, más paciencia
+        tolerancia = {
+            2: 35,   # Slide intro: máximo 35 segundos sin cantar
+            3: 50,   # Puente lento: hasta 50 segundos
+            4: 65,   # Primer coro: hasta 65 segundos (mucha gente ora aquí)
+        }.get(self.current_slide, 60)
+
+        if tiempo_desde_ultimo_progreso > tolerancia:
+            print(f"IGNICIÓN INTELIGENTE: {tiempo_desde_ultimo_progreso:.1f}s sin progreso → Cambio forzado (slide {self.current_slide} → {self.current_slide + 1})")
+            return "CHANGE_SLIDE"
+
+        return None
+
+
+    def forzar_siguiente_slide(self):
+        """FUNCIÓN PÚBLICA para tecla de emergencia (F8, pedal, etc.)"""
+        print("🚨 BOTÓN DE EMERGENCIA PRESIONADO → Cambio inmediato")
+        self.ultimo_cambio_slide = time.time()
+        self.aplausos_detectados = 0
+        self.coro_repetido_detectado = False
+        return "CHANGE_SLIDE"
+
+    def resetear_a_inicio(self):
+        """Detecta frases como "Vamos a cantar", "Esta canción dice", etc."""
+        print("RESETEO AUTOMÁTICO → Volviendo al slide 2")
+        self.current_slide = 2
+        self.current_word_index = 0
+        self.start_time = time.time()
+        self.aplausos_detectados = 0
+        self.coro_repetido_detectado = False
+        self._preload_slides_ahead(3)
+
+
 
 def load_lyrics_data(json_file):
     try:
@@ -414,57 +736,4 @@ def load_lyrics_data(json_file):
         print(f"❌ Error cargando {json_file}: {e}")
         return {}
 
-# ... (el resto del código de prueba se mantiene igual)
 
-# El resto del código de prueba se mantiene igual...
-def simulate_audio_input():
-    """
-    Simula entrada de audio para pruebas
-    Ahora incluye las palabras FINALES del slide
-    """
-    # Simulación COMPLETA del slide 2
-    test_phrases = [
-        ["quiero", "levantar"],
-        ["quiero", "levantar", "a", "ti"],
-        ["quiero", "levantar", "a", "ti", "mis", "manos"],
-        ["quiero", "levantar", "a", "ti", "mis", "manos", "y", "alabarte"],
-        ["al", "maravilloso", "jesús"],  # ¡Palabras finales!
-        ["milagroso", "señor"]  # ¡Últimas palabras!
-    ]
-    return test_phrases
-
-def main():
-    # Cargar datos de letras
-    lyrics_data = load_lyrics_data("lyrics_data.json")
-    if not lyrics_data:
-        return
-
-    # Inicializar tracker
-    tracker = LyricTracker(lyrics_data)
-
-    # Mostrar información inicial
-    print("\n" + "="*50)
-    print("INICIANDO PRUEBA DE SEGUIMIENTO")
-    print("="*50)
-
-    # Simular reconocimiento de audio
-    test_phrases = simulate_audio_input()
-
-    for i, phrase in enumerate(test_phrases):
-        print(f"\n--- Frase {i+1} ---")
-        result = tracker.process_recognized_text(phrase)
-
-        if result == "CHANGE_SLIDE":
-            print("🚨 ¡SEÑAL PARA CAMBIAR SLIDE!")
-            if tracker.next_slide():
-                print("✅ Slide cambiado exitosamente")
-            else:
-                print("❌ No hay más slides")
-                break
-
-    print("\n" + "="*50)
-    print("PRUEBA COMPLETADA")
-    print("="*50)
-
-if __name__ == "__main__":
-    main()

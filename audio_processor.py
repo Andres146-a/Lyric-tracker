@@ -20,7 +20,13 @@ class AudioProcessor:
         
         # Configurar tracker de letras
         self.tracker = LyricTracker(lyrics_data)
+        self.chunk_size = 1024  # Mayor calidad
+        self.rate = 44100      # Alta frecuencia de muestreo
+        self.interval = 0.03   # Procesamiento más frecuente
         
+        # ✅ FILTROS MEJORADOS para audio limpio
+        self.noise_threshold = 0.01  # Menos sensible a ruido
+        self.silence_limit = 0.8     # Menos tolerancia a silencios
         # Configurar audio
         self.audio = pyaudio.PyAudio()
         self.stream = None
@@ -28,6 +34,21 @@ class AudioProcessor:
         
         print("🎤 Procesador de Audio Inicializado")
     
+    def _optimized_voice_activity_detection(self, audio_data):
+        """Detección de voz más agresiva para buen micrófono"""
+        volume_norm = np.linalg.norm(audio_data) * (1.0 / self.chunk_size)
+        
+        # ✅ UMBRAL MÁS BAJO (micrófono bueno = menos ruido)
+        if volume_norm > self.noise_threshold:
+            # ✅ ANÁLISIS ESPECTRAL para mejor detección
+            frequencies = np.fft.fft(audio_data)
+            dominant_freq = np.argmax(np.abs(frequencies))
+            
+            # La voz humana generalmente está entre 85-255 Hz
+            if 85 <= dominant_freq <= 255:
+                return True
+        
+        return False
     def start_listening(self):
         """Inicia la escucha del micrófono"""
         try:

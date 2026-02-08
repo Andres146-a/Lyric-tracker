@@ -1,30 +1,41 @@
 {
     "audio": {
-        "sample_rate": 16000,
+       "sample_rate": 16000,
         "channels": 1,
-        "chunk_size": 512,
-        "processing_interval": 0.06,
-        "sleep_time": 0.01
+        "chunk_size": 384,
+        "processing_interval": 0.03,
+        "sleep_time": 0.006
     },
-    "tracking": {
-        "change_threshold": 1,
-        "confidence_threshold": 0.5,
-        "look_ahead_distance": 10,
-        "min_word_length": 2,
-        "force_change_threshold": 3,
-        "early_change_ratio": 0.70,
-        "duplicated_first_half_threshold": 0.90,
-        "duplicated_second_half_threshold": 0.80
-    },
+
     "powerpoint": {
         "advance_key": "pagedown",
         "back_key": "pageup"
     },
+    
     "slide_change": {
         "long_slide_threshold": 12,
-        "progress_threshold_short": 0.70,
-        "progress_threshold_long": 0.65,
-        "remaining_words_short": 1,
-        "remaining_words_long": 2
+        "progress_threshold_short": 0.85,
+        "progress_threshold_long": 0.80,
+        "remaining_words_short": 2,
+        "remaining_words_long": 3,
+        "duplicated_second_half_threshold": 0.75
+    },
+    "tracking": {
+        "change_threshold": 2,
+        "look_ahead_distance": 6,
+        "min_word_length": 2,
+        "force_change_threshold": 2,
+        "early_change_ratio": 0.80
+    },
+     "phase_2_1_extreme": {
+        "aggressive_mode": true,
+        "hardware_optimized": true,
+        "normal_slide_threshold": 0.65,
+        "duplicated_first_half_threshold": 0.65,
+        "duplicated_second_half_threshold": 0.40,
+        "min_words_for_change": 1,
+        "anti_stuck_timeout": 8.0,
+        "preload_slides_ahead": 3,
+        "audio_quality": "high"
     }
 }
